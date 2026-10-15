@@ -376,7 +376,14 @@ def register_routes(app):
             action = request.form.get("action")
             row = CartItem.query.filter_by(id=request.form.get("item_id", type=int), user_id=user.id).first()
             if action == "add":
-                variant = db.session.get(Variant, request.form.get("variant_id", type=int))
+                variant_id = request.form.get("variant_id", type=int)
+                variant = db.session.get(Variant, variant_id) if variant_id else None
+                if not variant:
+                    product_id = request.form.get("product_id", type=int)
+                    selected_size = request.form.get("size_choice", "").strip()
+                    selected_color = request.form.get("color_choice", "").strip()
+                    if product_id and selected_size and selected_color:
+                        variant = Variant.query.filter_by(product_id=product_id, size=selected_size, color=selected_color).first()
                 qty = request.form.get("quantity", 1, type=int)
                 if not variant or not variant.product.active or qty < 1:
                     flash("Choose an available size and color.", "danger")
