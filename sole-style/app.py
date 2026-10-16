@@ -1,6 +1,8 @@
 """SoleStyle footwear reservation application."""
 import os
 import secrets
+import hashlib
+import hmac
 from datetime import datetime, timedelta
 from decimal import Decimal
 from functools import wraps
@@ -8,7 +10,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from flask import (Flask, abort, flash, jsonify, redirect, render_template, request,
-                   session, url_for)
+                   render_template_string, session, url_for)
 from flask_socketio import SocketIO, join_room
 from flask_sqlalchemy import SQLAlchemy
 from flask_wtf.csrf import CSRFProtect
@@ -148,6 +150,13 @@ class Activity(db.Model):
 class Setting(db.Model):
     key = db.Column(db.String(80), primary_key=True)
     value = db.Column(db.String(500), nullable=False)
+
+
+class AdminRecoveryUse(db.Model):
+    """Records a consumed recovery secret so it cannot be replayed."""
+    __tablename__ = "admin_recovery_use"
+    token_digest = db.Column(db.String(64), primary_key=True)
+    used_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
 
 STATUSES = ["Pending Confirmation", "Confirmed", "Ready for Pickup", "Completed", "Cancelled"]
@@ -367,6 +376,75 @@ def register_routes(app):
         if User.query.filter_by(role="admin").first():
             return "Initial administrator has already been created.", 403
         return "Run `flask --app app create-admin` from a trusted local terminal. This one-time setup route does not expose administrator creation over the web.", 200
+
+    @app.route("/admin/recover", methods=["GET", "POST"])
+    def recover_admin_access():
+        """One-time recovery for an existing admin, gated by a Render secret."""
+        recovery_secret = os.getenv("ADMIN_RECOVERY_TOKEN", "")
+        if len(recovery_secret) < 32:
+            abort(404)
+
+        page = '''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>Admin account recovery — SoleStyle</title><style>
+        *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#f4f1ec;color:#191815;font:16px/1.5 Arial,sans-serif}
+        main{width:min(100%,460px);padding:36px;background:#fff;border:1px solid #e6e0d8;border-radius:18px;box-shadow:0 24px 70px #251b1018}
+        .eyebrow{font-size:12px;letter-spacing:.16em;color:#a45d3b;font-weight:700}h1{font:600 34px/1.1 Georgia,serif;margin:12px 0}p{color:#716b63;margin:0 0 22px}
+        label{display:block;font-size:13px;font-weight:700;margin:16px 0 6px}input{width:100%;padding:13px;border:1px solid #d8d0c7;border-radius:9px;font-size:15px}
+        button{width:100%;margin-top:22px;padding:14px;border:0;border-radius:9px;background:#201d19;color:#fff;font-size:15px;font-weight:700;cursor:pointer}
+        .notice{padding:12px;border-radius:8px;background:#f8eee6;color:#734125;margin-bottom:14px}
+        </style><main><div class="eyebrow">SOLESTYLE · ACCOUNT SUPPORT</div><h1>Recover admin access</h1>
+        <p>Use the temporary recovery code set in Render to reset an existing administrator account.</p>
+        {% for category,message in get_flashed_messages(with_categories=true) %}<div class="notice">{{ message }}</div>{% endfor %}
+        <form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label for="token">Temporary recovery code</label><input id="token" name="token" type="password" required autocomplete="off">
+        <label for="email">Admin email <span style="font-weight:400">(leave blank if your shop has one admin)</span></label><input id="email" name="email" type="email" autocomplete="username">
+        <label for="password">New password (at least 12 characters)</label><input id="password" name="password" type="password" minlength="12" required autocomplete="new-password">
+        <label for="confirm">Confirm new password</label><input id="confirm" name="confirm" type="password" minlength="12" required autocomplete="new-password">
+        <button type="submit">Reset admin password</button></form></main></html>'''
+
+        if request.method == "GET":
+            return render_template_string(page)
+
+        submitted_secret = request.form.get("token", "")
+        if not hmac.compare_digest(submitted_secret, recovery_secret):
+            flash("Recovery code is invalid or has already been used.", "danger")
+            return render_template_string(page), 403
+
+        password = request.form.get("password", "")
+        if len(password) < 12 or password != request.form.get("confirm", ""):
+            flash("Use matching passwords with at least 12 characters.", "danger")
+            return render_template_string(page), 400
+
+        admin_email = request.form.get("email", "").strip().lower()
+        if admin_email:
+            admin = User.query.filter_by(email=admin_email, role="admin").first()
+        else:
+            admins = User.query.filter_by(role="admin", active=True).order_by(User.id.asc()).all()
+            admin = admins[0] if len(admins) == 1 else None
+        if not admin:
+            flash("Enter the email if there is more than one admin, or check that an admin account exists.", "danger")
+            return render_template_string(page), 404
+
+        # Create only this recovery table on first use; record the token digest
+        # before changing the password so concurrent requests cannot replay it.
+        AdminRecoveryUse.__table__.create(db.engine, checkfirst=True)
+        token_digest = hashlib.sha256(recovery_secret.encode("utf-8")).hexdigest()
+        try:
+            if db.session.get(AdminRecoveryUse, token_digest):
+                flash("Recovery code is invalid or has already been used.", "danger")
+                return render_template_string(page), 403
+            db.session.add(AdminRecoveryUse(token_digest=token_digest))
+            db.session.flush()
+            admin.password_hash = generate_password_hash(password)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            flash("Recovery could not be completed. Please generate a new code and try again.", "danger")
+            return render_template_string(page), 500
+
+        session.clear()
+        flash(f"Admin password reset for {admin.email}. Sign in, then remove ADMIN_RECOVERY_TOKEN from Render.", "success")
+        return redirect(url_for("login"))
 
     @app.route("/cart", methods=["GET", "POST"])
     @login_required
